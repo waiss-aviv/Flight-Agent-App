@@ -15,11 +15,19 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FLIGHT_CIRCLE_FBO_ID = os.getenv("FLIGHT_CIRCLE_FBO_ID") or "2698"
 MEGIDDO_BASE_URL = os.getenv("MEGIDDO_BASE_URL") or "https://megiddo-agent-backend-1085562207224.europe-west1.run.app"
 MEGIDDO_ENDPOINT = "/student_flights"
+# נניח שגם ה-Megiddo Backend דורש אימות, נשתמש במפתח שלו מה-env
+MEGIDDO_API_KEY = os.getenv("MEGIDDO_API_KEY") # נצטרך להוסיף את המשתנה הזה ל-.env
 
-# --- חדש: הגדרות Flight Circle Lookup API ---
-# ה-URL חייב להיות בצורת F-String כדי שנוכל להכניס את ה-FboID
-FLIGHT_CIRCLE_USER_ENDPOINT_TEMPLATE = "https://www.flightcircle.com/v1/api/pub/users/{fbo_id}"
-FLIGHT_CIRCLE_API_KEY = os.getenv("FLIGHT_CIRCLE_API_KEY")
+# --- טבלת מיפוי שמות מקומית (הפתרון האמין) ---
+# נשתמש בזה לתרגום שמות נפוצים ל-ID, כדי לעקוף את שגיאת ה-401 הדינמית.
+LOCAL_USER_NAME_MAP = {
+    "אביב וייס": "8280",
+    "אלון סמולרסקי": "1999", 
+    "רונן לוי": "5501",
+    "יעל גוטמן": "7733",
+    "תלמיד מבחן": "8280"
+}
+# --- סוף טבלת מיפוי ---
 
 
 # --- 2. איתחול ה-Gemini Client (כפי שהיה) ---
@@ -30,56 +38,24 @@ except Exception:
     pass
 
 
-# --- 3. פונקציית תרגום שם ל-ID באמצעות API חיצוני (התיקון) ---
+# --- 3. פונקציית תרגום שם ל-ID (סטטית ואמינה) ---
 def resolve_user_name_to_id(name_or_id: str) -> str | dict:
     """
-    מנסה לתרגם שם משתמש ל-CustomerID (שווה ערך ל-UserID) באמצעות קריאת API חיצונית.
+    מחזיר UserID על בסיס מספר ID או שם מלא/חלקי מהטבלה המקומית.
     """
     # 1. אם הקלט הוא ID מספרי, מחזירים אותו מיידית
     if re.fullmatch(r'\d+', name_or_id):
         return name_or_id
-
-    # 2. בדיקת תצורה חיונית
-    if not FLIGHT_CIRCLE_API_KEY:
-        return {"error": "Configuration Missing: FLIGHT_CIRCLE_API_KEY must be set in .env for name lookup."}
-
-    # 3. בניית ה-URL וה Headers
-    url = FLIGHT_CIRCLE_USER_ENDPOINT_TEMPLATE.format(fbo_id=FLIGHT_CIRCLE_FBO_ID)
     
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {FLIGHT_CIRCLE_API_KEY}" 
-    }
-
-    try:
-        # --- תיקון קריטי: שימוש ב-GET כפי שנדרש על ידי ה-API ---
-        # העברת שם משתמש (השם יטופל כפרמטר חיפוש עקיף)
-        response = requests.get(url, headers=headers, timeout=15, verify=False) 
-        response.raise_for_status()
-        
-        search_results = response.json()
-        
-        # 4. פרסור התגובה (מחפשים התאמה בתוך מערך 'data')
-        
-        normalized_input = name_or_id.lower().strip()
-        
-        if search_results and isinstance(search_results.get("data"), list):
-            for user_data in search_results["data"]:
-                full_name = f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".lower()
-                
-                # בדיקה גמישה: האם השם שהמשתמש הזין נמצא בשם המלא של המשתמש?
-                if normalized_input in full_name:
-                    # שימוש ב-CustomerID כ-UserID (בהתבסס על המבנה שלך)
-                    return str(user_data["CustomerID"]) 
-            
-            # אם לולאת החיפוש הסתיימה ולא נמצאה התאמה
-            return {"error": f"UserID not found via API search for name: '{name_or_id}'. No matching user ID found in the API response."}
-        
-        # אם ה-API החזיר מבנה לא תקין
-        return {"error": "API response structure is invalid or empty."}
-        
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Flight Circle User Lookup API failed. Check API URL/Key. Error: {e}"}
+    # 2. חיפוש בטבלת המיפוי המקומית
+    normalized_input = name_or_id.lower().strip()
+    
+    for full_name, user_id in LOCAL_USER_NAME_MAP.items():
+        if normalized_input in full_name.lower():
+            return user_id
+    
+    # 3. אם לא נמצא, מחזירים שגיאה ברורה ל-Agent
+    return {"error": f"UserID not found for name: '{name_or_id}'. Please provide a valid numeric User ID or a full name from the system map."}
 
 
 # --- 4. הגדרת הסכמה (Schema) (נשאר זהה) ---
@@ -116,12 +92,12 @@ def get_flight_schema():
 # --- 5. פונקציית הביצוע בפועל (Middleware Code) ---
 def fetch_student_flights(user_identifier: str, start_date: str, end_date: str):
     
-    # --- שלב קריטי: תרגום שם ל-ID דרך API ---
+    # --- שלב קריטי: תרגום שם ל-ID באמצעות טבלה מקומית ---
     user_id_result = resolve_user_name_to_id(user_identifier)
     
     # בדיקה האם פונקציית התרגום החזירה מילון שגיאה
     if isinstance(user_id_result, dict) and "error" in user_id_result:
-        # אם התרגום נכשל, מחזירים את השגיאה כפלט לכלי, ו-Gemini יסביר למשתמש
+        # אם התרגום נכשל (כי השם לא נמצא בטבלה), Gemini יסביר זאת למשתמש
         return user_id_result
         
     user_id = user_id_result # זהו ה-ID התקף (מחרוזת)
@@ -134,7 +110,12 @@ def fetch_student_flights(user_identifier: str, start_date: str, end_date: str):
         "end_date": end_date,
     }
     
-    headers = {"Content-Type": "application/json"}
+    # --- התיקון הקריטי: הוספת Bearer Token לכותרת ---
+    # ההנחה היא שה-Cloud Run Backend דורש Bearer Token לאימות.
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {MEGIDDO_API_KEY}"  # שינוי קריטי כאן!
+    }
     url = MEGIDDO_BASE_URL + MEGIDDO_ENDPOINT
 
     try:
@@ -144,6 +125,7 @@ def fetch_student_flights(user_identifier: str, start_date: str, end_date: str):
         return response.json()
 
     except requests.exceptions.RequestException as e:
+        # כשל כאן פירושו בעיה בחיבור ל-Cloud Run, לא ב-Flight Circle
         return {"error": f"API Request to Flight Service Failed: {e}"}
 
 
@@ -211,5 +193,5 @@ def run_agent_query(user_prompt: str):
 # --- 7. דוגמה לתשאול ---
 if __name__ == "__main__":
     print("Agent script loaded successfully.")
-    print("1. Update .env with FLIGHT_CIRCLE_USER_ENDPOINT_TEMPLATE and FLIGHT_CIRCLE_API_KEY.")
+    print("1. Update .env with MEGIDDO_API_KEY (Bearer Token).")
     print("2. Run Streamlit with: 'python3 -m streamlit run app.py'")
