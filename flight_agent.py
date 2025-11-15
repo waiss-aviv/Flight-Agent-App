@@ -17,11 +17,11 @@ MEGIDDO_BASE_URL = os.getenv("MEGIDDO_BASE_URL") or "https://megiddo-agent-backe
 MEGIDDO_ENDPOINT = "/student_flights"
 
 # --- חדש: משתני סביבה עבור API Lookup דינמי ---
-FLIGHT_CIRCLE_USER_ENDPOINT = os.getenv("FLIGHT_CIRCLE_USER_ENDPOINT")
+FLIGHT_CIRCLE_USER_ENDPOINT = os.getenv("FLIGHT_CIRCLE_USER_ENDPOINT") 
 FLIGHT_CIRCLE_API_KEY = os.getenv("FLIGHT_CIRCLE_API_KEY") 
 
 
-# --- 2. איתחול ה-Gemini Client ---
+# --- 2. איתחול ה-Gemini Client (כפי שהיה) ---
 try:
     client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception:
@@ -33,7 +33,6 @@ except Exception:
 def resolve_user_name_to_id(name_or_id: str) -> str | dict:
     """
     מנסה לתרגם שם משתמש ל-UserID תקף באמצעות קריאת ה-API של Flight Circle.
-    אם הקלט הוא מספר, הוא מוחזר ישירות.
     """
     # 1. אם הקלט הוא ID מספרי, מחזירים אותו מיידית
     if re.fullmatch(r'\d+', name_or_id):
@@ -44,10 +43,10 @@ def resolve_user_name_to_id(name_or_id: str) -> str | dict:
         return {"error": "Configuration Missing: FLIGHT_CIRCLE_API_KEY and FLIGHT_CIRCLE_USER_ENDPOINT must be set in .env for dynamic name lookup."}
 
     # 3. הכנת הקריאה ל-Flight Circle User Describe Endpoint
-    search_payload = {
+    # תיקון קריטי: מעבר לשיטת GET והעברת נתונים כפרמטרי שאילתה (params)
+    search_params = {
         "fbo_id": FLIGHT_CIRCLE_FBO_ID,
-        # הנחה: ה-API מקבל את השם המלא בשדה 'name'
-        "name": name_or_id, 
+        "name": name_or_id, # שליחת השם כפרמטר שאילתה
     }
     
     headers = {
@@ -57,15 +56,15 @@ def resolve_user_name_to_id(name_or_id: str) -> str | dict:
 
     try:
         url = FLIGHT_CIRCLE_USER_ENDPOINT
-        # קריאת API עם עקיפת אימות SSL
-        response = requests.post(url, headers=headers, json=search_payload, timeout=15, verify=False)
+        # --- תיקון: שימוש ב-requests.get והעברת נתונים ל-params ---
+        response = requests.get(url, headers=headers, params=search_params, timeout=15, verify=False)
+        
         response.raise_for_status()
         
         search_results = response.json()
         
         # --- פרסור התגובה: מחפש את מפתח 'ID' (כפי שמופיע בנתוני המשתמש שלך) ---
         if search_results and isinstance(search_results, list) and search_results[0].get("ID"):
-            # שימוש במפתח 'ID'
             return str(search_results[0]["ID"]) 
         
         # אם לא נמצא ID תואם
@@ -115,7 +114,7 @@ def fetch_student_flights(user_identifier: str, start_date: str, end_date: str):
     
     # בדיקה האם פונקציית התרגום החזירה מילון שגיאה
     if isinstance(user_id_result, dict) and "error" in user_id_result:
-        # אם התרגום נכשל, מחזירים את השגיאה כפלט לכלי, ו-Gemini יסביר למשתמש
+        # אם התרגום נכשל, מחזירים את השגיאה כפלט לכלי
         return user_id_result
         
     user_id = user_id_result # זהו ה-ID התקף (מחרוזת)
@@ -145,7 +144,7 @@ def fetch_student_flights(user_identifier: str, start_date: str, end_date: str):
 
 def run_agent_query(user_prompt: str):
     
-    # ודא שה-Client אותר (אם האתחול נכשל בשלב 2)
+    # ודא שה-Client אותר
     if 'client' not in globals():
         return "שגיאה: Gemini Client לא אותחל בהצלחה. אנא בדוק את מפתח ה-API בקובץ .env."
 
