@@ -5,74 +5,74 @@ from google import genai
 from google.genai import types
 import requests.exceptions
 import json
+import re
 
 # --- 1. הגדרות וטעינת סודות ---
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# הגדרות קבועות ל-API של מגידו/Flight Circle
+# הגדרות קבועות ל-API של מגידו/Cloud Run
 FLIGHT_CIRCLE_FBO_ID = os.getenv("FLIGHT_CIRCLE_FBO_ID") or "2698"
 MEGIDDO_BASE_URL = os.getenv("MEGIDDO_BASE_URL") or "https://megiddo-agent-backend-1085562207224.europe-west1.run.app"
 MEGIDDO_ENDPOINT = "/student_flights"
 
-# --- חדש: משתני סביבה עבור API Lookup ---
+# --- חדש: משתני סביבה עבור API Lookup דינמי ---
 FLIGHT_CIRCLE_USER_ENDPOINT = os.getenv("FLIGHT_CIRCLE_USER_ENDPOINT")
-FLIGHT_CIRCLE_API_KEY = os.getenv("FLIGHT_CIRCLE_API_KEY")
+FLIGHT_CIRCLE_API_KEY = os.getenv("FLIGHT_CIRCLE_API_KEY") 
+
 
 # --- 2. איתחול ה-Gemini Client ---
 try:
     client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception:
     print("FATAL ERROR: Failed to initialize Gemini Client. Check GEMINI_API_KEY in .env.")
-    # באפליקציה פרוסה, רצוי להחזיר שגיאה במקום לצאת
-    # raise
     pass
 
 
 # --- 3. פונקציית תרגום שם ל-ID באמצעות API חיצוני ---
 def resolve_user_name_to_id(name_or_id: str) -> str | dict:
     """
-    מנסה לתרגם שם משתמש ל-UserID תקף באמצעות קריאת API חיצונית.
+    מנסה לתרגם שם משתמש ל-UserID תקף באמצעות קריאת ה-API של Flight Circle.
     אם הקלט הוא מספר, הוא מוחזר ישירות.
     """
-    # אם הקלט הוא מספר, נניח שהוא ה-UserID התקף ונחזיר אותו
-    if name_or_id.isdigit():
+    # 1. אם הקלט הוא ID מספרי, מחזירים אותו מיידית
+    if re.fullmatch(r'\d+', name_or_id):
         return name_or_id
 
-    # בדיקת תצורה חיונית
+    # 2. בדיקת תצורה חיונית
     if not FLIGHT_CIRCLE_API_KEY or not FLIGHT_CIRCLE_USER_ENDPOINT:
-        return {"error": "Configuration Missing: FLIGHT_CIRCLE_API_KEY and FLIGHT_CIRCLE_USER_ENDPOINT must be set in .env for name lookup."}
+        return {"error": "Configuration Missing: FLIGHT_CIRCLE_API_KEY and FLIGHT_CIRCLE_USER_ENDPOINT must be set in .env for dynamic name lookup."}
 
-    # --- מבנה הקריאה ל-API (היפותטי, ייתכן שצריך להתאים למבנה Flight Circle) ---
+    # 3. הכנת הקריאה ל-Flight Circle User Describe Endpoint
     search_payload = {
         "fbo_id": FLIGHT_CIRCLE_FBO_ID,
-        "search_term": name_or_id,
+        # הנחה: ה-API מקבל את השם המלא בשדה 'name'
+        "name": name_or_id, 
     }
     
     headers = {
         "Content-Type": "application/json",
-        # אימות - ייתכן שיהיה צורך לשנות את 'Bearer' לפרמטר אחר לפי דרישת Flight Circle
         "Authorization": f"Bearer {FLIGHT_CIRCLE_API_KEY}" 
     }
 
     try:
         url = FLIGHT_CIRCLE_USER_ENDPOINT
-        # שימוש ב-verify=False רק לצורך בדיקות, יש להסירו ב-Production
+        # קריאת API עם עקיפת אימות SSL
         response = requests.post(url, headers=headers, json=search_payload, timeout=15, verify=False)
         response.raise_for_status()
         
         search_results = response.json()
         
-        # --- הנחת יסוד: ה-API מחזיר רשימת משתמשים, ואנו לוקחים את הראשון ---
-        if search_results and isinstance(search_results, list) and search_results[0].get("user_id"):
-            # ודא שה-ID הוא מחרוזת
-            return str(search_results[0]["user_id"])
+        # --- פרסור התגובה: מחפש את מפתח 'ID' (כפי שמופיע בנתוני המשתמש שלך) ---
+        if search_results and isinstance(search_results, list) and search_results[0].get("ID"):
+            # שימוש במפתח 'ID'
+            return str(search_results[0]["ID"]) 
         
-        # אם הקריאה הצליחה אבל לא נמצאו תוצאות
-        return {"error": f"UserID not found via API search for name: {name_or_id}. No matching user ID returned."}
+        # אם לא נמצא ID תואם
+        return {"error": f"UserID not found via Flight Circle API search for name: '{name_or_id}'. The API returned 0 matching users."}
         
     except requests.exceptions.RequestException as e:
-        return {"error": f"Flight Circle User Lookup API failed with status code {response.status_code if 'response' in locals() else 'N/A'}: {e}"}
+        return {"error": f"Flight Circle User Lookup API failed. Check API URL/Key. Error: {e}"}
 
 
 # --- 4. הגדרת הסכמה (Schema) ---
@@ -86,7 +86,6 @@ def get_flight_schema():
                 parameters=types.Schema(
                     type=types.Type.OBJECT,
                     properties={
-                        # השם נשאר 'user_identifier' כדי ש-Gemini יבין שמדובר בשם/ID
                         "user_identifier": types.Schema(
                             type=types.Type.STRING,
                             description="Flight Circle UserID (e.g., '8280') or the student's name (e.g., 'אביב כהן')."
@@ -114,16 +113,17 @@ def fetch_student_flights(user_identifier: str, start_date: str, end_date: str):
     # --- שלב קריטי: תרגום שם ל-ID דרך API ---
     user_id_result = resolve_user_name_to_id(user_identifier)
     
+    # בדיקה האם פונקציית התרגום החזירה מילון שגיאה
     if isinstance(user_id_result, dict) and "error" in user_id_result:
-        # אם התרגום נכשל, מחזירים את השגיאה כפלט לכלי
+        # אם התרגום נכשל, מחזירים את השגיאה כפלט לכלי, ו-Gemini יסביר למשתמש
         return user_id_result
         
     user_id = user_id_result # זהו ה-ID התקף (מחרוזת)
 
-    # הפנייה ל-API של מגידו/Cloud Run
+    # הפנייה ל-API של מגידו/Cloud Run (ה-API המקורי שלך)
     request_body = {
         "fbo_id": FLIGHT_CIRCLE_FBO_ID,
-        "user_id": user_id,  # נשלח את ה-ID שתורגם/נמצא
+        "user_id": user_id,  # נשלח את ה-ID שתורגם
         "start_date": start_date,
         "end_date": end_date,
     }
@@ -144,8 +144,11 @@ def fetch_student_flights(user_identifier: str, start_date: str, end_date: str):
 # --- 6. לולאת השיחה והתשאול (Agent Orchestration) ---
 
 def run_agent_query(user_prompt: str):
-    # ... (הלוגיקה נשארת זהה) ...
     
+    # ודא שה-Client אותר (אם האתחול נכשל בשלב 2)
+    if 'client' not in globals():
+        return "שגיאה: Gemini Client לא אותחל בהצלחה. אנא בדוק את מפתח ה-API בקובץ .env."
+
     print(f"--- User Query ---\n{user_prompt}\n")
     
     messages = [
@@ -170,7 +173,6 @@ def run_agent_query(user_prompt: str):
         
         # 1. הפעלה אוטומטית של פונקציית הביצוע
         if func_name == "fetch_student_flights":
-            # הפונקציה כוללת כעת את לוגיקת התרגום
             tool_output = fetch_student_flights(**func_args) 
         else:
             tool_output = {"error": f"Unknown function: {func_name}"}
@@ -200,7 +202,8 @@ def run_agent_query(user_prompt: str):
     return response.text
 
 
-# --- דוגמה לתשאול ---
+# --- 7. דוגמה לתשאול ---
 if __name__ == "__main__":
-    print("Agent script loaded successfully. Please ensure .env is updated with the new Flight Circle keys.")
-    print("Run Streamlit with: 'python3 -m streamlit run app.py'")
+    print("Agent script loaded successfully.")
+    print("1. Update .env with FLIGHT_CIRCLE_USER_ENDPOINT and FLIGHT_CIRCLE_API_KEY.")
+    print("2. Run Streamlit with: 'python3 -m streamlit run app.py'")
