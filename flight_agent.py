@@ -3,43 +3,93 @@ import requests
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from datetime import datetime, timedelta
-import json
 import requests.exceptions
+import json
 
 # --- 1. הגדרות וטעינת סודות ---
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # הגדרות קבועות ל-API של מגידו/Flight Circle
-FLIGHT_CIRCLE_FBO_ID = "2698"
-MEGIDDO_BASE_URL = "https://megiddo-agent-backend-1085562207224.europe-west1.run.app"
+FLIGHT_CIRCLE_FBO_ID = os.getenv("FLIGHT_CIRCLE_FBO_ID") or "2698"
+MEGIDDO_BASE_URL = os.getenv("MEGIDDO_BASE_URL") or "https://megiddo-agent-backend-1085562207224.europe-west1.run.app"
 MEGIDDO_ENDPOINT = "/student_flights"
+
+# --- חדש: משתני סביבה עבור API Lookup ---
+FLIGHT_CIRCLE_USER_ENDPOINT = os.getenv("FLIGHT_CIRCLE_USER_ENDPOINT")
+FLIGHT_CIRCLE_API_KEY = os.getenv("FLIGHT_CIRCLE_API_KEY")
 
 # --- 2. איתחול ה-Gemini Client ---
 try:
     client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception:
-    # במקום לצאת, נחזיר הודעת שגיאה ל-UI אם ה-Client לא מאותחל
     print("FATAL ERROR: Failed to initialize Gemini Client. Check GEMINI_API_KEY in .env.")
-    # הפונקציה תטפל בשגיאה זו בהמשך, כעת נמשיך (אך הקריאה ל-API תכשל)
+    # באפליקציה פרוסה, רצוי להחזיר שגיאה במקום לצאת
+    # raise
     pass
 
 
-# --- 3. הגדרת הסכמה (Schema) באופן ידני ---
+# --- 3. פונקציית תרגום שם ל-ID באמצעות API חיצוני ---
+def resolve_user_name_to_id(name_or_id: str) -> str | dict:
+    """
+    מנסה לתרגם שם משתמש ל-UserID תקף באמצעות קריאת API חיצונית.
+    אם הקלט הוא מספר, הוא מוחזר ישירות.
+    """
+    # אם הקלט הוא מספר, נניח שהוא ה-UserID התקף ונחזיר אותו
+    if name_or_id.isdigit():
+        return name_or_id
+
+    # בדיקת תצורה חיונית
+    if not FLIGHT_CIRCLE_API_KEY or not FLIGHT_CIRCLE_USER_ENDPOINT:
+        return {"error": "Configuration Missing: FLIGHT_CIRCLE_API_KEY and FLIGHT_CIRCLE_USER_ENDPOINT must be set in .env for name lookup."}
+
+    # --- מבנה הקריאה ל-API (היפותטי, ייתכן שצריך להתאים למבנה Flight Circle) ---
+    search_payload = {
+        "fbo_id": FLIGHT_CIRCLE_FBO_ID,
+        "search_term": name_or_id,
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+        # אימות - ייתכן שיהיה צורך לשנות את 'Bearer' לפרמטר אחר לפי דרישת Flight Circle
+        "Authorization": f"Bearer {FLIGHT_CIRCLE_API_KEY}" 
+    }
+
+    try:
+        url = FLIGHT_CIRCLE_USER_ENDPOINT
+        # שימוש ב-verify=False רק לצורך בדיקות, יש להסירו ב-Production
+        response = requests.post(url, headers=headers, json=search_payload, timeout=15, verify=False)
+        response.raise_for_status()
+        
+        search_results = response.json()
+        
+        # --- הנחת יסוד: ה-API מחזיר רשימת משתמשים, ואנו לוקחים את הראשון ---
+        if search_results and isinstance(search_results, list) and search_results[0].get("user_id"):
+            # ודא שה-ID הוא מחרוזת
+            return str(search_results[0]["user_id"])
+        
+        # אם הקריאה הצליחה אבל לא נמצאו תוצאות
+        return {"error": f"UserID not found via API search for name: {name_or_id}. No matching user ID returned."}
+        
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Flight Circle User Lookup API failed with status code {response.status_code if 'response' in locals() else 'N/A'}: {e}"}
+
+
+# --- 4. הגדרת הסכמה (Schema) ---
 def get_flight_schema():
     """Defines the JSON schema for the fetch_student_flights function."""
     return types.Tool(
         function_declarations=[
             types.FunctionDeclaration(
                 name="fetch_student_flights",
-                description="Fetches a list of historical flight records and logbook entries for a specific student (identified by user_id) within a given date range. Use this for all queries about student flight history, logbook, or training history.",
+                description="Fetches flight records for a student within a date range. The 'user_identifier' can be a UserID number OR the student's full name (e.g., 'אביב כהן').",
                 parameters=types.Schema(
                     type=types.Type.OBJECT,
                     properties={
-                        "user_id": types.Schema(
+                        # השם נשאר 'user_identifier' כדי ש-Gemini יבין שמדובר בשם/ID
+                        "user_identifier": types.Schema(
                             type=types.Type.STRING,
-                            description="Flight Circle UserID of the student."
+                            description="Flight Circle UserID (e.g., '8280') or the student's name (e.g., 'אביב כהן')."
                         ),
                         "start_date": types.Schema(
                             type=types.Type.STRING,
@@ -50,19 +100,30 @@ def get_flight_schema():
                             description="End date for the search range (YYYY-MM-DD). Default to today's date."
                         )
                     },
-                    required=["user_id", "start_date", "end_date"]
+                    required=["user_identifier", "start_date", "end_date"]
                 )
             )
         ]
     )
 
-# --- 4. פונקציית הביצוע בפועל (Middleware Code) ---
-def fetch_student_flights(user_id: str, start_date: str, end_date: str):
-    """מבצע את קריאת ה-API ל-Cloud Run."""
+
+# --- 5. פונקציית הביצוע בפועל (Middleware Code) ---
+def fetch_student_flights(user_identifier: str, start_date: str, end_date: str):
+    """מבצע את קריאת ה-API ל-Cloud Run לאחר תרגום השם ל-ID (אם נדרש)."""
     
+    # --- שלב קריטי: תרגום שם ל-ID דרך API ---
+    user_id_result = resolve_user_name_to_id(user_identifier)
+    
+    if isinstance(user_id_result, dict) and "error" in user_id_result:
+        # אם התרגום נכשל, מחזירים את השגיאה כפלט לכלי
+        return user_id_result
+        
+    user_id = user_id_result # זהו ה-ID התקף (מחרוזת)
+
+    # הפנייה ל-API של מגידו/Cloud Run
     request_body = {
         "fbo_id": FLIGHT_CIRCLE_FBO_ID,
-        "user_id": user_id,
+        "user_id": user_id,  # נשלח את ה-ID שתורגם/נמצא
         "start_date": start_date,
         "end_date": end_date,
     }
@@ -71,38 +132,31 @@ def fetch_student_flights(user_id: str, start_date: str, end_date: str):
     url = MEGIDDO_BASE_URL + MEGIDDO_ENDPOINT
 
     try:
-        # --- תיקון ה-SSL: הוספת verify=False כדי לעקוף שגיאת אימות ---
+        # קריאת API לשרת הטיסות (Cloud Run)
         response = requests.post(url, headers=headers, json=request_body, timeout=15, verify=False)
         response.raise_for_status()
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        return {"error": f"API Request Failed: {e}"}
+        return {"error": f"API Request to Flight Service Failed: {e}"}
 
 
-# --- 5. לולאת השיחה והתשאול (Agent Orchestration) ---
+# --- 6. לולאת השיחה והתשאול (Agent Orchestration) ---
 
 def run_agent_query(user_prompt: str):
-    """
-    מריץ שאילתה אחת ב-Gemini ומחזיר את התשובה הסופית כטקסט.
-    """
+    # ... (הלוגיקה נשארת זהה) ...
     
-    # ודא שה-Client אכן אותר (אם האתחול נכשל בשלב 2)
-    if 'client' not in globals():
-        return "שגיאה: Gemini Client לא אותחל בהצלחה. אנא בדוק את מפתח ה-API בקובץ .env."
-
     print(f"--- User Query ---\n{user_prompt}\n")
     
     messages = [
         types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
     ]
     
-    # קריאה ראשונה למודל (מצרף את הסכמה הידנית)
     response = client.models.generate_content(
         model='gemini-2.5-flash',
         contents=messages,
         config=types.GenerateContentConfig(
-            tools=[get_flight_schema()] # שימוש בסכמה המוגדרת
+            tools=[get_flight_schema()] 
         )
     )
 
@@ -116,7 +170,8 @@ def run_agent_query(user_prompt: str):
         
         # 1. הפעלה אוטומטית של פונקציית הביצוע
         if func_name == "fetch_student_flights":
-            tool_output = fetch_student_flights(**func_args)
+            # הפונקציה כוללת כעת את לוגיקת התרגום
+            tool_output = fetch_student_flights(**func_args) 
         else:
             tool_output = {"error": f"Unknown function: {func_name}"}
 
@@ -135,18 +190,17 @@ def run_agent_query(user_prompt: str):
             contents=messages
         )
 
-    # הדפסת ה-Debug לטרמינל (עדיין חשוב)
+    # הדפסת התשובה הסופית
     print("-" * 40)
     print("Gemini Response (in Hebrew):")
     print(response.text)
     print("-" * 40)
     
-    # --- השינוי הקריטי: החזרת התשובה ל-Streamlit ---
+    # החזרת התשובה ל-Streamlit
     return response.text
 
 
-# --- הדגמה/ניקוי סופי לקובץ ---
+# --- דוגמה לתשאול ---
 if __name__ == "__main__":
-    # פונקציה זו כבר לא מריצה את הקוד לבד, אלא רק מציגה איך משתמשים בה
-    # כדי להריץ את ה-Agent, השתמש ב-streamlit run app.py
-    print("Agent script loaded successfully. Please run 'streamlit run app.py'.")
+    print("Agent script loaded successfully. Please ensure .env is updated with the new Flight Circle keys.")
+    print("Run Streamlit with: 'python3 -m streamlit run app.py'")
