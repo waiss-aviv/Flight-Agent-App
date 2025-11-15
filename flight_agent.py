@@ -5,7 +5,7 @@ from google import genai
 from google.genai import types
 import requests.exceptions
 import json
-import re # ייבוא מודול Regex לבדיקת מספרים
+import re
 
 # --- 1. הגדרות וטעינת סודות ---
 load_dotenv()
@@ -16,11 +16,9 @@ FLIGHT_CIRCLE_FBO_ID = os.getenv("FLIGHT_CIRCLE_FBO_ID") or "2698"
 MEGIDDO_BASE_URL = os.getenv("MEGIDDO_BASE_URL") or "https://megiddo-agent-backend-1085562207224.europe-west1.run.app"
 MEGIDDO_ENDPOINT = "/student_flights"
 
-# --- חדש: הגדרות Flight Circle Lookup API (דינמי) ---
-# ה-URL חייב להיות בצורת F-String כדי שנוכל להכניס את ה-FboID
-FLIGHT_CIRCLE_USER_ENDPOINT_TEMPLATE = "https://www.flightcircle.com/v1/api/pub/users/{fbo_id}"
-FLIGHT_CIRCLE_API_KEY = os.getenv("FLIGHT_CIRCLE_API_KEY") # זהו ה-Bearer Token
-
+# --- חדש: Endpoint לחיפוש שמות (Cloud Run) ---
+MEGIDDO_USER_LOOKUP_URL = os.getenv("MEGIDDO_USER_LOOKUP_URL") or "https://flight-agent-api-1085562207224.europe-west1.run.app/users/by-name" 
+MEGIDDO_API_KEY = os.getenv("MEGIDDO_API_KEY") # מפתח ה-Bearer Token לאימות
 
 # --- 2. איתחול ה-Gemini Client (כפי שהיה) ---
 try:
@@ -30,71 +28,52 @@ except Exception:
     pass
 
 
-# --- 3. פונקציית תרגום שם ל-ID באמצעות API חיצוני (דינמי) ---
+# --- 3. פונקציית תרגום שם ל-ID באמצעות API (דינמי) ---
 def resolve_user_name_to_id(name_or_id: str) -> str | dict:
     """
-    מנסה לתרגם שם משתמש ל-CustomerID (שווה ערך ל-UserID) באמצעות קריאת API חיצונית.
+    מנסה לתרגם שם משתמש ל-ID באמצעות קריאת GET ל-Cloud Run Lookup Endpoint.
     """
     # 1. אם הקלט הוא ID מספרי, מחזירים אותו מיידית
     if re.fullmatch(r'\d+', name_or_id):
-        print(f"Identifier '{name_or_id}' is numeric, using as ID.")
         return name_or_id
 
-    # 2. בדיקת תצורה חיונית (האם המפתח ל-Flight Circle הוזן ב-.env)
-    if not FLIGHT_CIRCLE_API_KEY:
-        print("Dynamic name lookup failed: FLIGHT_CIRCLE_API_KEY is not set in .env.")
-        return {"error": "Configuration Missing: FLIGHT_CIRCLE_API_KEY must be set in .env for name lookup."}
-
-    # 3. בניית ה-URL וה Headers
-    url = FLIGHT_CIRCLE_USER_ENDPOINT_TEMPLATE.format(fbo_id=FLIGHT_CIRCLE_FBO_ID)
-    
+    # 2. בניית Headers עם Bearer Token (לאימות מול ה-Backend שלך)
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {FLIGHT_CIRCLE_API_KEY}" # <-- שימוש ב-Bearer Token
+        "Authorization": f"Bearer {MEGIDDO_API_KEY}" 
     }
+    
+    # 3. בניית פרמטרי השאילתה (Name Lookup)
+    params = {"name": name_or_id}
 
     try:
-        print(f"Performing dynamic lookup for name: '{name_or_id}' at {url}...")
-        
-        # 4. ביצוע קריאת GET (כדי למנוע שגיאת 405)
-        response = requests.get(url, headers=headers, timeout=15, verify=False) 
-        response.raise_for_status() # יעצור כאן אם נקבל 401 (Unauthorized)
+        # קריאת GET ל-Endpoint החדש שלך ב-Cloud Run (users/by-name)
+        response = requests.get(
+            MEGIDDO_USER_LOOKUP_URL, 
+            headers=headers, 
+            params=params, 
+            timeout=15, 
+            verify=False
+        ) 
+        response.raise_for_status()
         
         search_results = response.json()
         
-        # 5. פרסור התגובה (מחפשים התאמה בתוך מערך 'data')
-        normalized_input = name_or_id.lower().strip()
-        
-        if search_results and isinstance(search_results.get("data"), list):
-            for user_data in search_results["data"]:
-                first = user_data.get('first_name', '').lower()
-                last = user_data.get('last_name', '').lower()
-                full_name = f"{first} {last}"
-                
-                # בדיקה גמישה: האם השם שהמשתמש הזין נמצא בשם המלא?
-                if normalized_input in full_name:
-                    customer_id = str(user_data.get("CustomerID"))
-                    print(f"Name '{name_or_id}' resolved to CustomerID: {customer_id}")
-                    return customer_id
+        # 4. פרסור התגובה: אם יש תוצאות, קח את ה-ID הראשון
+        if search_results and isinstance(search_results, list) and len(search_results) > 0:
+            # ה-ID שה-Backend החזיר הוא בתוך השדה 'id'
+            customer_id = str(search_results[0].get("id"))
             
-            # אם לולאת החיפוש הסתיימה ולא נמצאה התאמה
-            print(f"Name '{name_or_id}' not found in API response.")
-            return {"error": f"UserID not found via API search for name: '{name_or_id}'. No matching user ID found."}
+            if customer_id and customer_id != "None":
+                return customer_id
         
-        # אם ה-API החזיר מבנה לא תקין
-        print(f"API response structure invalid: {search_results}")
-        return {"error": "API response structure for user lookup is invalid or empty."}
+        # 5. אם לולאת החיפוש הסתיימה ולא נמצאה התאמה
+        return {"error": f"UserID not found for name: '{name_or_id}'. Please provide a valid full name or a numeric User ID."}
         
-    except requests.exceptions.HTTPError as e:
-        # יתפוס 401 Unauthorized אם ה-Bearer Token שגוי
-        print(f"HTTPError during name lookup: {e}")
-        return {"error": f"Flight Circle User Lookup API failed. Check API Key/Permissions. Error: {e}"}
     except requests.exceptions.RequestException as e:
-        print(f"RequestException during name lookup: {e}")
-        return {"error": f"Flight Circle User Lookup API connection failed. Error: {e}"}
+        return {"error": f"Cloud Run User Lookup connection failed. Error: {e}"}
 
 
-# --- 4. הגדרת הסכמה (Schema) (נשאר זהה) ---
+# --- 4. הגדרת הסכמה (Schema) (כפי שהיה) ---
 def get_flight_schema():
     """Defines the JSON schema for the fetch_student_flights function."""
     return types.Tool(
@@ -146,7 +125,11 @@ def fetch_student_flights(user_identifier: str, start_date: str, end_date: str):
         "end_date": end_date,
     }
     
-    headers = {"Content-Type": "application/json"}
+    # --- הוספת Bearer Token לאימות ---
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {MEGIDDO_API_KEY}" # השתמש במפתח לאימות Cloud Run
+    }
     url = MEGIDDO_BASE_URL + MEGIDDO_ENDPOINT
 
     try:
@@ -215,3 +198,13 @@ def run_agent_query(user_prompt: str):
     print("Gemini Response (in Hebrew):")
     print(response.text)
     print("-" * 40)
+    
+    # החזרת התשובה ל-Streamlit
+    return response.text
+
+
+# --- 7. דוגמה לתשאול ---
+if __name__ == "__main__":
+    print("Agent script loaded successfully.")
+    print("1. Update .env with MEGIDDO_API_KEY (Bearer Token).")
+    print("2. Run Streamlit with: 'python3 -m streamlit run app.py'")
